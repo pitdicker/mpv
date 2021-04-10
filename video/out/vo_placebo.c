@@ -20,6 +20,7 @@
 #include <libplacebo/gpu.h>
 #include <libplacebo/swapchain.h>
 #include <libplacebo/utils/libav.h>
+#include <libplacebo/utils/frame_queue.h>
 
 #include "config.h"
 #include "common/common.h"
@@ -32,17 +33,6 @@
 #include "vulkan/context.h"
 #endif
 
-struct overlay {
-    const struct pl_tex *tex;
-    struct pl_overlay_part *parts;
-    int num_parts;
-};
-
-static const bool subfmt_all[SUBBITMAP_COUNT] = {
-    [SUBBITMAP_LIBASS] = true,
-    [SUBBITMAP_RGBA]   = true,
-};
-
 enum preset {
     PRESET_DEFAULT = 0,
     PRESET_LOW = 1,
@@ -50,6 +40,22 @@ enum preset {
 };
 
 static const struct pl_render_params low_quality_params = {0};
+static const struct pl_render_params *presets[] = {
+    [PRESET_DEFAULT] = &pl_render_default_params,
+    [PRESET_LOW]     = &low_quality_params,
+    [PRESET_HIGH]    = &pl_render_high_quality_params,
+};
+
+struct osd_entry {
+    const struct pl_tex *tex;
+    struct pl_overlay_part *parts;
+    int num_parts;
+};
+
+struct osd_state {
+    struct osd_entry entries[MAX_OSD_PARTS];
+    struct pl_overlay overlays[MAX_OSD_PARTS];
+};
 
 struct priv {
     struct mp_log *log;
@@ -59,33 +65,48 @@ struct priv {
 
     struct pl_context *ctx;
     struct pl_renderer *rr;
+    struct pl_queue *queue;
     const struct pl_gpu *gpu;
     const struct pl_swapchain *sw;
-    const struct pl_tex *video_tex[4];
     const struct pl_fmt *osd_fmt[SUBBITMAP_COUNT];
-    struct overlay osd[MAX_OSD_PARTS];
+    const struct pl_tex **sub_tex;
+    int num_sub_tex;
 
     struct mp_rect src, dst;
-    struct mp_osd_res osdres;
+    struct mp_osd_res osd_res;
+    struct osd_state osd_state;
     struct bstr icc_profile;
     uint64_t icc_signature;
+
+    uint64_t last_id;
+    double last_pts;
 };
 
-static void write_overlays(struct vo *vo, struct pl_frame *frame,
-                           const struct sub_bitmap_list *subs)
+static void write_overlays(struct vo *vo, struct mp_osd_res res, double pts,
+                           int flags, struct osd_state *state,
+                           struct pl_frame *frame)
 {
     struct priv *p = vo->priv;
+    static const bool subfmt_all[SUBBITMAP_COUNT] = {
+        [SUBBITMAP_LIBASS] = true,
+        [SUBBITMAP_RGBA]   = true,
+    };
+
+    struct sub_bitmap_list *subs = osd_render(vo->osd, res, pts, flags, subfmt_all);
+    frame->num_overlays = 0;
+    frame->overlays = state->overlays;
 
     for (int n = 0; n < subs->num_items; n++) {
         const struct sub_bitmaps *item = subs->items[n];
         if (!item->num_parts || !item->packed)
             continue;
-        struct overlay *osd = &p->osd[item->render_index];
+        struct osd_entry *entry = &state->entries[item->render_index];
         const struct pl_fmt *tex_fmt = p->osd_fmt[item->format];
-        bool ok = pl_tex_recreate(p->gpu, &osd->tex, &(struct pl_tex_params) {
+        MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
+        bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
             .format = tex_fmt,
-            .w = MPMAX(item->packed_w, osd->tex ? osd->tex->params.w : 0),
-            .h = MPMAX(item->packed_h, osd->tex ? osd->tex->params.h : 0),
+            .w = MPMAX(item->packed_w, entry->tex ? entry->tex->params.w : 0),
+            .h = MPMAX(item->packed_h, entry->tex ? entry->tex->params.h : 0),
             .host_writable = true,
             .sampleable = true,
         });
@@ -94,7 +115,7 @@ static void write_overlays(struct vo *vo, struct pl_frame *frame,
             break;
         }
         ok = pl_tex_upload(p->gpu, &(struct pl_tex_transfer_params) {
-            .tex        = osd->tex,
+            .tex        = entry->tex,
             .rc         = { .x1 = item->packed_w, .y1 = item->packed_h, },
             .stride_w   = item->packed->stride[0] / tex_fmt->texel_size,
             .ptr        = item->packed->planes[0],
@@ -104,11 +125,11 @@ static void write_overlays(struct vo *vo, struct pl_frame *frame,
             break;
         }
 
-        osd->num_parts = 0;
+        entry->num_parts = 0;
         for (int i = 0; i < item->num_parts; i++) {
             const struct sub_bitmap *b = &item->parts[i];
             uint32_t c = b->libass.color;
-            MP_TARRAY_APPEND(vo, osd->parts, osd->num_parts, (struct pl_overlay_part) {
+            MP_TARRAY_APPEND(p, entry->parts, entry->num_parts, (struct pl_overlay_part) {
                 .src = { b->src_x, b->src_y, b->src_x + b->w, b->src_y + b->h },
                 .dst = { b->x, b->y, b->x + b->dw, b->y + b->dh },
                 .color = {
@@ -120,12 +141,11 @@ static void write_overlays(struct vo *vo, struct pl_frame *frame,
             });
         }
 
-        int ol_idx = frame->num_overlays++;
-        struct pl_overlay *ol = (struct pl_overlay *) &frame->overlays[ol_idx];
+        struct pl_overlay *ol = &state->overlays[frame->num_overlays++];
         *ol = (struct pl_overlay) {
-            .tex = osd->tex,
-            .parts = osd->parts,
-            .num_parts = osd->num_parts,
+            .tex = entry->tex,
+            .parts = entry->parts,
+            .num_parts = entry->num_parts,
             .color = frame->color,
         };
 
@@ -140,23 +160,92 @@ static void write_overlays(struct vo *vo, struct pl_frame *frame,
             break;
         }
     }
+
+    talloc_free(subs);
 }
 
-static void draw_image(struct vo *vo, mp_image_t *mpi)
+struct frame_priv {
+    struct vo *vo;
+    struct osd_state subs;
+};
+
+static bool map_frame(const struct pl_gpu *gpu, const struct pl_tex **tex,
+                      const struct pl_source_frame *src, struct pl_frame *out_frame)
+{
+    struct mp_image *mpi = src->frame_data;
+    struct frame_priv *fp = mpi->priv;
+    struct vo *vo = fp->vo;
+
+    struct AVFrame *avframe = mp_image_to_av_frame(mpi);
+    bool ok = pl_upload_avframe(gpu, out_frame, tex, avframe);
+    av_frame_free(&avframe);
+    if (!ok) {
+        MP_ERR(vo, "Failed uploading frame!\n");
+        return false;
+    }
+
+    // Generate subtitles for this frame
+    struct mp_osd_res vidres = { mpi->w, mpi->h };
+    write_overlays(vo, vidres, mpi->pts, OSD_DRAW_SUB_ONLY, &fp->subs, out_frame);
+    return true;
+}
+
+static void unmap_frame(const struct pl_gpu *gpu, struct pl_frame *frame,
+                        const struct pl_source_frame *src)
+{
+    struct mp_image *mpi = src->frame_data;
+    struct frame_priv *fp = mpi->priv;
+    struct priv *p = fp->vo->priv;
+    for (int i = 0; i < MP_ARRAY_SIZE(fp->subs.entries); i++) {
+        const struct pl_tex *tex = fp->subs.entries[i].tex;
+        if (tex)
+            MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
+    }
+    talloc_free(mpi);
+}
+
+static void discard_frame(const struct pl_source_frame *src)
+{
+    struct mp_image *mpi = src->frame_data;
+    talloc_free(mpi);
+}
+
+static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
     const struct pl_gpu *gpu = p->gpu;
-    struct pl_swapchain_frame swframe;
-    if (!pl_swapchain_start_frame(p->sw, &swframe)) {
-        talloc_free(mpi);
-        return;
+
+    // Push all incoming frames into the frame queue
+    for (int n = 0; n < frame->num_frames; n++) {
+        int id = frame->frame_id + n;
+        if (id <= p->last_id)
+            continue; // don't re-upload already seen frames
+
+        struct mp_image *mpi = mp_image_new_ref(frame->frames[n]);
+        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
+        mpi->priv = fp;
+        fp->vo = vo;
+
+        pl_queue_push(p->queue, &(struct pl_source_frame) {
+            .pts = mpi->pts,
+            .frame_data = mpi,
+            .map = map_frame,
+            .unmap = unmap_frame,
+            .discard = discard_frame,
+        });
+        p->last_id = id;
     }
+
+    struct pl_swapchain_frame swframe;
+    if (!pl_swapchain_start_frame(p->sw, &swframe))
+        return;
 
     bool valid = false;
 
     // Calculate target
     struct pl_frame target;
     pl_frame_from_swapchain(&target, &swframe);
+    write_overlays(vo, p->osd_res, 0, OSD_DRAW_OSD_ONLY, &p->osd_state, &target);
     target.crop = (struct pl_rect2df) { p->dst.x0, p->dst.y0, p->dst.x1, p->dst.y1 };
     target.profile = (struct pl_icc_profile) {
         .signature = p->icc_signature,
@@ -164,55 +253,79 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
         .len = p->icc_profile.len,
     };
 
-    // Calculate source frame
-    struct pl_frame image;
-    struct AVFrame *avframe = mp_image_to_av_frame(mpi);
-    if (!pl_upload_avframe(gpu, &image, p->video_tex, avframe)) {
-        MP_ERR(vo, "Failed uploading frame!\n");
-        goto error;
+    if (!frame->current) {
+        // FIXME: this doesn't render OSD
+        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
+        valid = true;
+        goto done;
     }
-    image.crop  = (struct pl_rect2df) { p->src.x0, p->src.y0, p->src.x1, p->src.y1 };
 
-    // Update overlays
-    struct pl_overlay image_ol[MAX_OSD_PARTS], target_ol[MAX_OSD_PARTS];
-    struct sub_bitmap_list *osd, *sub;
-    struct mp_osd_res vidres = { mpi->w, mpi->h };
-    osd = osd_render(vo->osd, p->osdres, mpi->pts, OSD_DRAW_OSD_ONLY, subfmt_all);
-    sub = osd_render(vo->osd, vidres, mpi->pts, OSD_DRAW_SUB_ONLY, subfmt_all);
-    target.overlays = target_ol;
-    image.overlays = image_ol;
-    write_overlays(vo, &target, osd);
-    write_overlays(vo, &image, sub);
-    talloc_free(osd);
-    talloc_free(sub);
+    // Update queue state
+    struct pl_queue_params qparams = {
+        .pts = frame->current->pts + frame->vsync_offset,
+        .radius = pl_frame_mix_radius(presets[p->preset]),
+        .vsync_duration = frame->vsync_interval,
+        .frame_duration = frame->ideal_frame_duration,
+    };
+
+    // mpv likes to generate sporadically jumping PTS shortly after
+    // initialization, but pl_queue does not like these. Hard-clamp as
+    // a simple work-around.
+    qparams.pts = MPMAX(qparams.pts, p->last_pts);
+    p->last_pts = qparams.pts;
+
+    struct pl_frame_mix mix;
+    switch (pl_queue_update(p->queue, &mix, &qparams)) {
+    case PL_QUEUE_ERR:
+        MP_ERR(vo, "Failed updating frames!\n");
+        goto done;
+    case PL_QUEUE_EOF:
+        abort(); // we never signal EOF
+    case PL_QUEUE_MORE:
+        if (!mix.num_frames)
+            goto done;
+        break;
+    case PL_QUEUE_OK:
+        break;
+    }
+
+    if (frame->still) {
+        // FIXME: also pick the "correct" frame
+        mix.num_frames = 1;
+    }
+
+
+    // Update source crop on all existing frames. We technically own the
+    // `pl_frame` struct so this is kosher.
+    //
+    // XXX: why is this needed? how come doing it in `map_frame` isn't
+    // as smooth as doing it here?
+    for (int i = 0; i < mix.num_frames; i++) {
+        struct pl_frame *img = (struct pl_frame *) mix.frames[i];
+        img->crop = (struct pl_rect2df) {
+            p->src.x0, p->src.y0, p->src.x1, p->src.y1,
+        };
+    }
+
 
     // Render frame
     if (pl_frame_is_cropped(&target))
         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
 
-    static const struct pl_render_params *presets[] = {
-        [PRESET_DEFAULT] = &pl_render_default_params,
-        [PRESET_LOW]     = &low_quality_params,
-        [PRESET_HIGH]    = &pl_render_high_quality_params,
-    };
-
-    if (!pl_render_image(p->rr, &image, &target, presets[p->preset])) {
+    if (!pl_render_image_mix(p->rr, &mix, &target, presets[p->preset])) {
         MP_ERR(vo, "Failed rendering frame!\n");
-        goto error;
+        goto done;
     }
 
     valid = true;
     // fall through
 
-error:
+done:
     if (!valid) // clear with purple to indicate error
         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
 
     if (!pl_swapchain_submit_frame(p->sw))
         MP_ERR(vo, "Failed presenting frame!\n");
-
-    av_frame_free(&avframe);
-    talloc_free(mpi);
 }
 
 static void flip_page(struct vo *vo)
@@ -240,7 +353,7 @@ static int query_format(struct vo *vo, int format)
 static void resize(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    vo_get_src_dst_rects(vo, &p->src, &p->dst, &p->osdres);
+    vo_get_src_dst_rects(vo, &p->src, &p->dst, &p->osd_res);
 }
 
 static int reconfig(struct vo *vo, struct mp_image_params *params)
@@ -281,9 +394,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
         // fall through
     case VOCTRL_SET_EQUALIZER:
     case VOCTRL_UPDATE_RENDER_OPTS:
-    case VOCTRL_RESET:
     case VOCTRL_PAUSE:
         vo->want_redraw = true;
+        return VO_TRUE;
+
+    case VOCTRL_RESET:
+        pl_queue_reset(p->queue);
+        p->last_id = 0;
         return VO_TRUE;
     }
 
@@ -322,10 +439,11 @@ static void wait_events(struct vo *vo, int64_t until_time_us)
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    for (int i = 0; i < MP_ARRAY_SIZE(p->video_tex); i++)
-        pl_tex_destroy(p->gpu, &p->video_tex[i]);
-    for (int i = 0; i < MP_ARRAY_SIZE(p->osd); i++)
-        pl_tex_destroy(p->gpu, &p->osd[i].tex);
+    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
+        pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
+    for (int i = 0; i < p->num_sub_tex; i++)
+        pl_tex_destroy(p->gpu, &p->sub_tex[i]);
+    pl_queue_destroy(&p->queue);
     pl_renderer_destroy(&p->rr);
     ra_ctx_destroy(&p->ra_ctx);
 }
@@ -355,9 +473,16 @@ static int preinit(struct vo *vo)
 
 done:
     p->rr = pl_renderer_create(p->ctx, p->gpu);
+    p->queue = pl_queue_create(p->gpu);
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_RGBA] = pl_find_named_fmt(p->gpu, "rgba8");
+
     // TODO: pl_renderer_save/load
+
+    // Request as many frames as possible from the decoder. This is not really
+    // wasteful since we pass these through libplacebo's frame queueing
+    // mechanism, which only uploads frames on an as-needed basis.
+    vo_set_queue_params(vo, 0, VO_MAX_REQ_FRAMES);
     return 0;
 
 err_out:
@@ -380,13 +505,12 @@ static const m_option_t options[] = {
 const struct vo_driver video_out_placebo = {
     .description = "Video output based on libplacebo",
     .name = "placebo",
-    //.caps = VO_CAP_ROTATE90,
     .preinit = preinit,
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
     //.get_image = get_image,
-    .draw_image = draw_image,
+    .draw_frame = draw_frame,
     .flip_page = flip_page,
     .get_vsync = get_vsync,
     .wait_events = wait_events,
