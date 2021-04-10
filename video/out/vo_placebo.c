@@ -79,8 +79,17 @@ struct priv {
     uint64_t icc_signature;
 
     uint64_t last_id;
-    double last_pts;
+    double last_src_pts;
+    double last_dst_pts;
 };
+
+static void reset_queue(struct priv *p)
+{
+    pl_queue_reset(p->queue);
+    p->last_id = 0;
+    p->last_src_pts = 0.0;
+    p->last_dst_pts = 0.0;
+}
 
 static void write_overlays(struct vo *vo, struct mp_osd_res res, double pts,
                            int flags, struct osd_state *state,
@@ -226,6 +235,11 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         mpi->priv = fp;
         fp->vo = vo;
 
+        // mpv sometimes glitches out and sends frames with backwards PTS
+        // discontinuities, this safeguard makes sure we always handle it
+        if (mpi->pts < p->last_src_pts)
+            reset_queue(p);
+
         pl_queue_push(p->queue, &(struct pl_source_frame) {
             .pts = mpi->pts,
             .frame_data = mpi,
@@ -233,6 +247,8 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
             .unmap = unmap_frame,
             .discard = discard_frame,
         });
+
+        p->last_src_pts = mpi->pts;
         p->last_id = id;
     }
 
@@ -271,8 +287,8 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     // mpv likes to generate sporadically jumping PTS shortly after
     // initialization, but pl_queue does not like these. Hard-clamp as
     // a simple work-around.
-    qparams.pts = MPMAX(qparams.pts, p->last_pts);
-    p->last_pts = qparams.pts;
+    qparams.pts = MPMAX(qparams.pts, p->last_dst_pts);
+    p->last_dst_pts = qparams.pts;
 
     struct pl_frame_mix mix;
     switch (pl_queue_update(p->queue, &mix, &qparams)) {
@@ -399,8 +415,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return VO_TRUE;
 
     case VOCTRL_RESET:
-        pl_queue_reset(p->queue);
-        p->last_id = 0;
+        reset_queue(p);
         return VO_TRUE;
     }
 
