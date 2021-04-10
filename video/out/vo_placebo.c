@@ -43,12 +43,19 @@ static const bool subfmt_all[SUBBITMAP_COUNT] = {
     [SUBBITMAP_RGBA]   = true,
 };
 
+enum preset {
+    PRESET_DEFAULT = 0,
+    PRESET_LOW = 1,
+    PRESET_HIGH = 2,
+};
+
+static const struct pl_render_params low_quality_params = {0};
+
 struct priv {
     struct mp_log *log;
     struct ra_ctx *ra_ctx;
-    char *context_name;
-    char *context_type;
     struct ra_ctx_opts opts;
+    int preset;
 
     struct pl_context *ctx;
     struct pl_renderer *rr;
@@ -183,7 +190,13 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
     if (pl_frame_is_cropped(&target))
         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
 
-    if (!pl_render_image(p->rr, &image, &target, NULL)) { // TODO: params
+    static const struct pl_render_params *presets[] = {
+        [PRESET_DEFAULT] = &pl_render_default_params,
+        [PRESET_LOW]     = &low_quality_params,
+        [PRESET_HIGH]    = &pl_render_high_quality_params,
+    };
+
+    if (!pl_render_image(p->rr, &image, &target, presets[p->preset])) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto error;
     }
@@ -344,6 +357,7 @@ done:
     p->rr = pl_renderer_create(p->ctx, p->gpu);
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_RGBA] = pl_find_named_fmt(p->gpu, "rgba8");
+    // TODO: pl_renderer_save/load
     return 0;
 
 err_out:
@@ -354,6 +368,10 @@ err_out:
 #define OPT_BASE_STRUCT struct priv
 static const m_option_t options[] = {
     // FIXME: lift the gpu-* options to be global
+    {"placebo-preset", OPT_CHOICE(preset,
+        {"default", PRESET_DEFAULT},
+        {"high",    PRESET_HIGH},
+        {"low",     PRESET_LOW})},
     {"placebo-debug", OPT_FLAG(opts.debug)},
     {"placebo-sw", OPT_FLAG(opts.allow_sw)},
     {0}
