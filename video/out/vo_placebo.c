@@ -81,6 +81,7 @@ struct priv {
     uint64_t last_id;
     double last_src_pts;
     double last_dst_pts;
+    bool is_interpolated;
 };
 
 static void reset_queue(struct priv *p)
@@ -257,6 +258,7 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         return;
 
     bool valid = false;
+    p->is_interpolated = false;
 
     // Calculate target
     struct pl_frame target;
@@ -296,8 +298,14 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
             break;
         }
 
+        const struct pl_frame *still_frame;
         if (frame->still && mix.num_frames > 1) {
-            // FIXME: also pick the "correct" frame
+            for (int i = 0; i < mix.num_frames; i++) {
+                if (i && mix.timestamps[i] > 0.0)
+                    break;
+                still_frame = mix.frames[i];
+            }
+            mix.frames = &still_frame;
             mix.num_frames = 1;
         }
 
@@ -320,6 +328,7 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         goto done;
     }
 
+    p->is_interpolated = mix.num_frames > 1;
     valid = true;
     // fall through
 
@@ -398,7 +407,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_SET_EQUALIZER:
     case VOCTRL_UPDATE_RENDER_OPTS:
     case VOCTRL_PAUSE:
-        vo->want_redraw = true;
+        if (p->is_interpolated)
+            vo->want_redraw = true;
         return VO_TRUE;
 
     case VOCTRL_RESET:
