@@ -730,7 +730,7 @@ video_output_features = [
     }, {
         'name': '--libplacebo',
         'desc': 'libplacebo support',
-        'func': check_pkg_config('libplacebo >= 3.124.0'),
+        'func': check_pkg_config('libplacebo >= 3.126.0'),
     }, {
         'name': '--vulkan',
         'desc':  'Vulkan context support',

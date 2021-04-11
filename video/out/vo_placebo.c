@@ -269,65 +269,52 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         .len = p->icc_profile.len,
     };
 
-    if (!frame->current) {
-        // FIXME: this doesn't render OSD
-        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
-        valid = true;
-        goto done;
-    }
-
-    // Update queue state
-    struct pl_queue_params qparams = {
-        .pts = frame->current->pts + frame->vsync_offset,
-        .radius = pl_frame_mix_radius(presets[p->preset]),
-        .vsync_duration = frame->vsync_interval,
-        .frame_duration = frame->ideal_frame_duration,
-    };
-
-    // mpv likes to generate sporadically jumping PTS shortly after
-    // initialization, but pl_queue does not like these. Hard-clamp as
-    // a simple work-around.
-    qparams.pts = MPMAX(qparams.pts, p->last_dst_pts);
-    p->last_dst_pts = qparams.pts;
-
-    struct pl_frame_mix mix;
-    switch (pl_queue_update(p->queue, &mix, &qparams)) {
-    case PL_QUEUE_ERR:
-        MP_ERR(vo, "Failed updating frames!\n");
-        goto done;
-    case PL_QUEUE_EOF:
-        abort(); // we never signal EOF
-    case PL_QUEUE_MORE:
-        if (!mix.num_frames)
-            goto done;
-        break;
-    case PL_QUEUE_OK:
-        break;
-    }
-
-    if (frame->still) {
-        // FIXME: also pick the "correct" frame
-        mix.num_frames = 1;
-    }
-
-
-    // Update source crop on all existing frames. We technically own the
-    // `pl_frame` struct so this is kosher.
-    //
-    // XXX: why is this needed? how come doing it in `map_frame` isn't
-    // as smooth as doing it here?
-    for (int i = 0; i < mix.num_frames; i++) {
-        struct pl_frame *img = (struct pl_frame *) mix.frames[i];
-        img->crop = (struct pl_rect2df) {
-            p->src.x0, p->src.y0, p->src.x1, p->src.y1,
+    struct pl_frame_mix mix = {0};
+    if (frame->current) {
+        // Update queue state
+        struct pl_queue_params qparams = {
+            .pts = frame->current->pts + frame->vsync_offset,
+            .radius = pl_frame_mix_radius(presets[p->preset]),
+            .vsync_duration = frame->vsync_interval,
+            .frame_duration = frame->ideal_frame_duration,
         };
-    }
 
+        // mpv likes to generate sporadically jumping PTS shortly after
+        // initialization, but pl_queue does not like these. Hard-clamp as
+        // a simple work-around.
+        qparams.pts = MPMAX(qparams.pts, p->last_dst_pts);
+        p->last_dst_pts = qparams.pts;
+
+        switch (pl_queue_update(p->queue, &mix, &qparams)) {
+        case PL_QUEUE_ERR:
+            MP_ERR(vo, "Failed updating frames!\n");
+            goto done;
+        case PL_QUEUE_EOF:
+            abort(); // we never signal EOF
+        case PL_QUEUE_MORE:
+        case PL_QUEUE_OK:
+            break;
+        }
+
+        if (frame->still && mix.num_frames > 1) {
+            // FIXME: also pick the "correct" frame
+            mix.num_frames = 1;
+        }
+
+        // Update source crop on all existing frames. We technically own the
+        // `pl_frame` struct so this is kosher.
+        //
+        // XXX: why is this needed? how come doing it in `map_frame` isn't as
+        // smooth as doing it here?
+        for (int i = 0; i < mix.num_frames; i++) {
+            struct pl_frame *img = (struct pl_frame *) mix.frames[i];
+            img->crop = (struct pl_rect2df) {
+                p->src.x0, p->src.y0, p->src.x1, p->src.y1,
+            };
+        }
+    }
 
     // Render frame
-    if (pl_frame_is_cropped(&target))
-        pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.0, 0.0, 0.0, 1.0 });
-
     if (!pl_render_image_mix(p->rr, &mix, &target, presets[p->preset])) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
@@ -415,6 +402,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return VO_TRUE;
 
     case VOCTRL_RESET:
+        pl_renderer_flush_cache(p->rr);
         reset_queue(p);
         return VO_TRUE;
     }
