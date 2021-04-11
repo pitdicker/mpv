@@ -4248,7 +4248,7 @@ struct mp_image *gl_video_get_image(struct gl_video *p, int imgfmt, int w, int h
     // (we expect vo.c to proxy the free callback, so it happens in the same
     // thread it was allocated in, removing the need for synchronization)
     struct mp_image *res = mp_image_from_buffer(imgfmt, w, h, stride_align,
-                                                ptr, alloc_size, p,
+                                                ptr, alloc_size, 0, p,
                                                 gl_video_dr_free_buffer);
     if (!res)
         gl_video_dr_free_buffer(p, ptr);

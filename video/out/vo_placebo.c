@@ -95,6 +95,73 @@ static void reset_queue(struct priv *p)
     p->last_dst_pts = 0.0;
 }
 
+// This header is stored at the beginning of DR-allocated buffers, and serves
+// to both detect such frames and hold the reference to the actual GPU buffer.
+static const uint64_t magic[2] = { 0xc6e9222474db53ae, 0x9d49b2de6c3b563e };
+struct dr_header {
+    uint64_t sentinel[2];
+    const struct pl_buf *buf;
+};
+
+static const struct pl_buf *detect_dr_buf(struct mp_image *mpi)
+{
+    if (!mpi->bufs[0] || mpi->bufs[0]->size < sizeof(struct dr_header))
+        return NULL;
+
+    struct dr_header *dr = (void *) mpi->bufs[0]->data;
+    if (memcmp(dr->sentinel, magic, sizeof(magic)) == 0)
+        return dr->buf;
+
+    return NULL;
+}
+
+static void free_dr_buffer(void *opaque, uint8_t *data)
+{
+    const struct pl_gpu *gpu = opaque;
+    struct dr_header *dr = (void *) data;
+    assert(!memcmp(dr->sentinel, magic, sizeof(magic)));
+    pl_buf_destroy(gpu, &dr->buf);
+}
+
+static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
+                                  int stride_align)
+{
+    struct priv *p = vo->priv;
+    const struct pl_gpu *gpu = p->gpu;
+    if (!(gpu->caps & PL_GPU_CAP_MAPPED_BUFFERS))
+        return NULL;
+
+    int size = mp_image_get_alloc_size(imgfmt, w, h, stride_align);
+    if (size < 0)
+        return NULL;
+
+    assert(gpu->caps & PL_GPU_CAP_THREAD_SAFE);
+    const struct pl_buf *buf = pl_buf_create(gpu, &(struct pl_buf_params) {
+        .size = sizeof(struct dr_header) + stride_align + size,
+        .memory_type = PL_BUF_MEM_HOST,
+        .host_mapped = true,
+    });
+
+    if (!buf)
+        return NULL;
+
+    // Store the DR header at the beginning of the allocation
+    struct dr_header *dr = (void *) buf->data;
+    memcpy(dr->sentinel, magic, sizeof(magic));
+    dr->buf = buf;
+
+    struct mp_image *mpi = mp_image_from_buffer(imgfmt, w, h, stride_align,
+                                                buf->data, size + stride_align,
+                                                sizeof(struct dr_header),
+                                                (void *) gpu, free_dr_buffer);
+    if (!mpi) {
+        pl_buf_destroy(gpu, &buf);
+        return NULL;
+    }
+
+    return mpi;
+}
+
 static void write_overlays(struct vo *vo, struct mp_osd_res res, double pts,
                            int flags, struct osd_state *state,
                            struct pl_frame *frame)
@@ -187,14 +254,36 @@ static bool map_frame(const struct pl_gpu *gpu, const struct pl_tex **tex,
 {
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
+    struct pl_plane_data data[4] = {0};
     struct vo *vo = fp->vo;
 
+    // Re-use the AVFrame helpers to make this infinitely easier
     struct AVFrame *avframe = mp_image_to_av_frame(mpi);
-    bool ok = pl_upload_avframe(gpu, out_frame, tex, avframe);
+    pl_frame_from_avframe(out_frame, avframe);
+    pl_plane_data_from_pixfmt(data, &out_frame->repr.bits, avframe->format);
     av_frame_free(&avframe);
-    if (!ok) {
-        MP_ERR(vo, "Failed uploading frame!\n");
-        return false;
+
+    for (int p = 0; p < mpi->num_planes; p++) {
+        data[p].width = mp_image_plane_w(mpi, p);
+        data[p].height = mp_image_plane_h(mpi, p);
+        data[p].row_stride = mpi->stride[p];
+        data[p].pixels = mpi->planes[p];
+
+        const struct pl_buf *buf = detect_dr_buf(mpi);
+        if (buf) {
+            data[p].pixels = NULL;
+            data[p].buf = buf;
+            data[p].buf_offset = mpi->planes[p] - buf->data;
+        } else if (gpu->caps & PL_GPU_CAP_CALLBACKS) {
+            data[p].callback = talloc_free;
+            data[p].priv = mp_image_new_ref(mpi);
+        }
+
+        if (!pl_upload_plane(gpu, &out_frame->planes[p], &tex[p], &data[p])) {
+            MP_ERR(vo, "Failed uploading frame!\n");
+            talloc_free(data[p].priv);
+            return false;
+        }
     }
 
     // Generate subtitles for this frame
@@ -543,7 +632,7 @@ const struct vo_driver video_out_placebo = {
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    //.get_image = get_image,
+    .get_image_ts = get_image,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
     .get_vsync = get_vsync,
