@@ -24,6 +24,8 @@
 
 #include "config.h"
 #include "common/common.h"
+#include "osdep/io.h"
+#include "stream/stream.h"
 #include "video/mp_image.h"
 #include "video/fmt-conversion.h"
 #include "gpu/context.h"
@@ -61,6 +63,7 @@ struct priv {
     struct mp_log *log;
     struct ra_ctx *ra_ctx;
     struct ra_ctx_opts opts;
+    char *cache_file;
     int preset;
 
     struct pl_context *ctx;
@@ -457,6 +460,19 @@ static void uninit(struct vo *vo)
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
     pl_queue_destroy(&p->queue);
+
+    if (p->cache_file) {
+        FILE *cache = fopen(p->cache_file, "wb");
+        if (cache) {
+            size_t size = pl_renderer_save(p->rr, NULL);
+            uint8_t *buf = talloc_size(NULL, size);
+            pl_renderer_save(p->rr, buf);
+            fwrite(buf, size, 1, cache);
+            talloc_free(buf);
+            fclose(cache);
+        }
+    }
+
     pl_renderer_destroy(&p->rr);
     ra_ctx_destroy(&p->ra_ctx);
 }
@@ -490,7 +506,11 @@ done:
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_RGBA] = pl_find_named_fmt(p->gpu, "rgba8");
 
-    // TODO: pl_renderer_save/load
+    if (p->cache_file && stat(p->cache_file, &(struct stat){0}) == 0) {
+        struct bstr c = stream_read_file(p->cache_file, p, vo->global, 1000000000);
+        pl_renderer_load(p->rr, c.start);
+        talloc_free(c.start);
+    }
 
     // Request as many frames as possible from the decoder. This is not really
     // wasteful since we pass these through libplacebo's frame queueing
@@ -512,6 +532,7 @@ static const m_option_t options[] = {
         {"low",     PRESET_LOW})},
     {"placebo-debug", OPT_FLAG(opts.debug)},
     {"placebo-sw", OPT_FLAG(opts.allow_sw)},
+    {"placebo-cache", OPT_STRING(cache_file), .flags = M_OPT_FILE},
     {0}
 };
 
