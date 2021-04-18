@@ -22,31 +22,26 @@
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
 
+#if PL_HAVE_LCMS
+#include <libplacebo/shaders/icc.h>
+#endif
+
 #include "config.h"
 #include "common/common.h"
+#include "options/m_config.h"
+#include "options/path.h"
 #include "osdep/io.h"
 #include "stream/stream.h"
 #include "video/mp_image.h"
 #include "video/fmt-conversion.h"
 #include "gpu/context.h"
+#include "gpu/video.h"
+#include "gpu/video_shaders.h"
 #include "sub/osd.h"
 
 #if HAVE_VULKAN
 #include "vulkan/context.h"
 #endif
-
-enum preset {
-    PRESET_DEFAULT = 0,
-    PRESET_LOW = 1,
-    PRESET_HIGH = 2,
-};
-
-static const struct pl_render_params low_quality_params = {0};
-static const struct pl_render_params *presets[] = {
-    [PRESET_DEFAULT] = &pl_render_default_params,
-    [PRESET_LOW]     = &low_quality_params,
-    [PRESET_HIGH]    = &pl_render_high_quality_params,
-};
 
 struct osd_entry {
     const struct pl_tex *tex;
@@ -62,9 +57,6 @@ struct osd_state {
 struct priv {
     struct mp_log *log;
     struct ra_ctx *ra_ctx;
-    struct ra_ctx_opts opts;
-    char *cache_file;
-    int preset;
 
     struct pl_context *ctx;
     struct pl_renderer *rr;
@@ -85,6 +77,24 @@ struct priv {
     double last_src_pts;
     double last_dst_pts;
     bool is_interpolated;
+
+    struct m_config_cache *opts_cache;
+    struct pl_render_params params;
+    struct pl_filter_config upscaler;
+    struct pl_filter_config downscaler;
+    struct pl_filter_config frame_mixer;
+    struct pl_deband_params deband;
+    struct pl_sigmoid_params sigmoid;
+    struct pl_color_adjustment color_adjustment;
+    struct pl_peak_detect_params peak_detect;
+    struct pl_color_map_params color_map;
+    struct pl_dither_params dither;
+    const struct pl_hook **hooks;
+    int num_hooks;
+
+#if PL_HAVE_LCMS
+    struct pl_icc_params icc;
+#endif
 };
 
 static void reset_queue(struct priv *p)
@@ -312,10 +322,13 @@ static void discard_frame(const struct pl_source_frame *src)
     talloc_free(mpi);
 }
 
+static void update_options(struct priv *p);
+
 static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
     const struct pl_gpu *gpu = p->gpu;
+    update_options(p);
 
     // Push all incoming frames into the frame queue
     for (int n = 0; n < frame->num_frames; n++) {
@@ -368,7 +381,7 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         // Update queue state
         struct pl_queue_params qparams = {
             .pts = frame->current->pts + frame->vsync_offset,
-            .radius = pl_frame_mix_radius(presets[p->preset]),
+            .radius = pl_frame_mix_radius(&p->params),
             .vsync_duration = frame->vsync_interval,
             .frame_duration = frame->ideal_frame_duration,
         };
@@ -415,7 +428,7 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     // Render frame
-    if (!pl_render_image_mix(p->rr, &mix, &target, presets[p->preset])) {
+    if (!pl_render_image_mix(p->rr, &mix, &target, &p->params)) {
         MP_ERR(vo, "Failed rendering frame!\n");
         goto done;
     }
@@ -497,11 +510,20 @@ static int control(struct vo *vo, uint32_t request, void *data)
         resize(vo);
         // fall through
     case VOCTRL_SET_EQUALIZER:
-    case VOCTRL_UPDATE_RENDER_OPTS:
     case VOCTRL_PAUSE:
         if (p->is_interpolated)
             vo->want_redraw = true;
         return VO_TRUE;
+
+    case VOCTRL_UPDATE_RENDER_OPTS: {
+        struct gl_video_opts *opts = mp_get_config_group(p->ra_ctx, vo->global, &gl_video_conf);
+        p->ra_ctx->opts.want_alpha = opts->alpha_mode == 1;
+        if (p->ra_ctx->fns->update_render_opts)
+            p->ra_ctx->fns->update_render_opts(p->ra_ctx);
+        update_options(p);
+        vo->want_redraw = true;
+        return VO_TRUE;
+    }
 
     case VOCTRL_RESET:
         pl_renderer_flush_cache(p->rr);
@@ -541,6 +563,19 @@ static void wait_events(struct vo *vo, int64_t until_time_us)
     }
 }
 
+static char *get_cache_file(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    struct gl_video_opts *opts = p->opts_cache->opts;
+    if (!opts->shader_cache_dir || !opts->shader_cache_dir[0])
+        return NULL;
+
+    char *dir = mp_get_user_path(NULL, vo->global, opts->shader_cache_dir);
+    char *file = mp_path_join(NULL, dir, "libplacebo.cache");
+    talloc_free(dir);
+    return file;
+}
+
 static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
@@ -550,8 +585,8 @@ static void uninit(struct vo *vo)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
     pl_queue_destroy(&p->queue);
 
-    if (p->cache_file) {
-        FILE *cache = fopen(p->cache_file, "wb");
+    for (char *cache_file = get_cache_file(vo); cache_file; TA_FREEP(&cache_file)) {
+        FILE *cache = fopen(cache_file, "wb");
         if (cache) {
             size_t size = pl_renderer_save(p->rr, NULL);
             uint8_t *buf = talloc_size(NULL, size);
@@ -564,14 +599,22 @@ static void uninit(struct vo *vo)
 
     pl_renderer_destroy(&p->rr);
     ra_ctx_destroy(&p->ra_ctx);
+    talloc_free(p->opts_cache);
 }
 
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    p->opts_cache = m_config_cache_alloc(NULL, vo->global, &gl_video_conf);
     p->log = vo->log;
 
-    p->ra_ctx = ra_ctx_create(vo, "vulkan", NULL, p->opts);
+    struct gl_video_opts *gl_opts = p->opts_cache->opts;
+    struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
+    struct ra_ctx_opts opts = *ctx_opts;
+    opts.context_type = "vulkan";
+    opts.context_name = NULL;
+    opts.want_alpha = gl_opts->alpha_mode == 1;
+    p->ra_ctx = ra_ctx_create(vo, opts);
     if (!p->ra_ctx)
         goto err_out;
 
@@ -595,10 +638,12 @@ done:
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_RGBA] = pl_find_named_fmt(p->gpu, "rgba8");
 
-    if (p->cache_file && stat(p->cache_file, &(struct stat){0}) == 0) {
-        struct bstr c = stream_read_file(p->cache_file, p, vo->global, 1000000000);
-        pl_renderer_load(p->rr, c.start);
-        talloc_free(c.start);
+    for (char *cache_file = get_cache_file(vo); cache_file; TA_FREEP(&cache_file)) {
+        if (stat(cache_file, &(struct stat){0}) == 0) {
+            struct bstr c = stream_read_file(cache_file, p, vo->global, 1000000000);
+            pl_renderer_load(p->rr, c.start);
+            talloc_free(c.start);
+        }
     }
 
     // Request as many frames as possible from the decoder. This is not really
@@ -612,18 +657,91 @@ err_out:
     return -1;
 }
 
-#define OPT_BASE_STRUCT struct priv
-static const m_option_t options[] = {
-    // FIXME: lift the gpu-* options to be global
-    {"placebo-preset", OPT_CHOICE(preset,
-        {"default", PRESET_DEFAULT},
-        {"high",    PRESET_HIGH},
-        {"low",     PRESET_LOW})},
-    {"placebo-debug", OPT_FLAG(opts.debug)},
-    {"placebo-sw", OPT_FLAG(opts.allow_sw)},
-    {"placebo-cache", OPT_STRING(cache_file), .flags = M_OPT_FILE},
-    {0}
-};
+static void update_options(struct priv *p)
+{
+    if (!m_config_cache_update(p->opts_cache))
+        return;
+
+    struct gl_video_opts *opts = p->opts_cache->opts;
+    p->params = pl_render_default_params;
+    p->params.lut_entries = 1 << opts->scaler_lut_size;
+    p->params.antiringing_strength = opts->scaler[0].antiring;
+    p->params.deband_params = opts->deband ? &p->deband : NULL;
+    p->params.sigmoid_params = opts->sigmoid_upscaling ? &p->sigmoid : NULL;
+    p->params.peak_detect_params = opts->tone_map.compute_peak >= 0 ? &p->peak_detect : NULL;
+    p->params.color_map_params = &p->color_map;
+    p->params.background_color[0] = opts->background.r / 255.0;
+    p->params.background_color[1] = opts->background.g / 255.0;
+    p->params.background_color[2] = opts->background.b / 255.0;
+    p->params.skip_anti_aliasing = !opts->correct_downscaling;
+    p->params.disable_linear_scaling = !opts->linear_downscaling && !opts->linear_upscaling;
+    p->params.disable_fbos = opts->dumb_mode == 1;
+
+    p->deband = pl_deband_default_params;
+    p->deband.iterations = opts->deband_opts->iterations;
+    p->deband.radius = opts->deband_opts->range;
+    p->deband.threshold = opts->deband_opts->threshold / 16.384;
+    p->deband.grain = opts->deband_opts->grain / 8.192;
+
+    p->sigmoid = pl_sigmoid_default_params;
+    p->sigmoid.center = opts->sigmoid_center;
+    p->sigmoid.slope = opts->sigmoid_slope;
+
+    p->peak_detect = pl_peak_detect_default_params;
+    p->peak_detect.smoothing_period = opts->tone_map.decay_rate;
+    p->peak_detect.scene_threshold_low = opts->tone_map.scene_threshold_low;
+    p->peak_detect.scene_threshold_high = opts->tone_map.scene_threshold_high;
+
+    static const enum pl_tone_mapping_algorithm tone_map_algos[] = {
+        [TONE_MAPPING_CLIP]     = PL_TONE_MAPPING_CLIP,
+        [TONE_MAPPING_MOBIUS]   = PL_TONE_MAPPING_MOBIUS,
+        [TONE_MAPPING_REINHARD] = PL_TONE_MAPPING_REINHARD,
+        [TONE_MAPPING_HABLE]    = PL_TONE_MAPPING_HABLE,
+        [TONE_MAPPING_GAMMA]    = PL_TONE_MAPPING_GAMMA,
+        [TONE_MAPPING_LINEAR]   = PL_TONE_MAPPING_LINEAR,
+        [TONE_MAPPING_BT_2390]  = PL_TONE_MAPPING_BT_2390,
+    };
+
+    p->color_map = pl_color_map_default_params;
+    p->color_map.intent = opts->icc_opts->intent;
+    p->color_map.tone_mapping_algo = tone_map_algos[opts->tone_map.curve];
+    p->color_map.tone_mapping_param = opts->tone_map.curve_param;
+    p->color_map.desaturation_strength = opts->tone_map.desat;
+    p->color_map.desaturation_exponent = opts->tone_map.desat_exp;
+    p->color_map.max_boost = opts->tone_map.max_boost;
+    p->color_map.gamut_warning = opts->tone_map.gamut_warning;
+    p->color_map.gamut_clipping = opts->tone_map.gamut_clipping;
+
+    switch (opts->dither_algo) {
+    case DITHER_ERROR_DIFFUSION:
+        MP_WARN(p, "Error diffusion dithering is not implemented.\n");
+        // fall through
+    case DITHER_NONE:
+        p->params.dither_params = NULL;
+        break;
+    case DITHER_ORDERED:
+    case DITHER_FRUIT:
+        p->params.dither_params = &p->dither;
+        p->dither = pl_dither_default_params;
+        p->dither.method = opts->dither_algo == DITHER_FRUIT
+                                ? PL_DITHER_BLUE_NOISE
+                                : PL_DITHER_ORDERED_FIXED;
+        p->dither.lut_size = opts->dither_size;
+        p->dither.temporal = opts->temporal_dither;
+        break;
+    }
+
+#if PL_HAVE_LCMS
+    int s_r = 0, s_g = 0, s_b = 0;
+    gl_parse_3dlut_size(opts->icc_opts->size_str, &s_r, &s_g, &s_b);
+    p->params.icc_params = &p->icc;
+    p->icc = pl_icc_default_params;
+    p->icc.intent = opts->icc_opts->intent;
+    p->icc.size_r = s_r;
+    p->icc.size_g = s_g;
+    p->icc.size_b = s_b;
+#endif
+}
 
 const struct vo_driver video_out_placebo = {
     .description = "Video output based on libplacebo",
@@ -640,5 +758,4 @@ const struct vo_driver video_out_placebo = {
     .wakeup = wakeup,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
-    .options = options,
 };
