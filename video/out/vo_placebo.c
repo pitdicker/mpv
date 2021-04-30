@@ -44,7 +44,7 @@
 #endif
 
 struct osd_entry {
-    const struct pl_tex *tex;
+    pl_tex tex;
     struct pl_overlay_part *parts;
     int num_parts;
 };
@@ -54,6 +54,12 @@ struct osd_state {
     struct pl_overlay overlays[MAX_OSD_PARTS];
 };
 
+struct scaler_params {
+    struct pl_filter_config config;
+    struct pl_filter_function kernel;
+    struct pl_filter_function window;
+};
+
 struct priv {
     struct mp_log *log;
     struct ra_ctx *ra_ctx;
@@ -61,10 +67,10 @@ struct priv {
     struct pl_context *ctx;
     struct pl_renderer *rr;
     struct pl_queue *queue;
-    const struct pl_gpu *gpu;
-    const struct pl_swapchain *sw;
-    const struct pl_fmt *osd_fmt[SUBBITMAP_COUNT];
-    const struct pl_tex **sub_tex;
+    pl_gpu gpu;
+    pl_swapchain sw;
+    pl_fmt osd_fmt[SUBBITMAP_COUNT];
+    pl_tex *sub_tex;
     int num_sub_tex;
 
     struct mp_rect src, dst;
@@ -80,15 +86,13 @@ struct priv {
 
     struct m_config_cache *opts_cache;
     struct pl_render_params params;
-    struct pl_filter_config upscaler;
-    struct pl_filter_config downscaler;
-    struct pl_filter_config frame_mixer;
     struct pl_deband_params deband;
     struct pl_sigmoid_params sigmoid;
     struct pl_color_adjustment color_adjustment;
     struct pl_peak_detect_params peak_detect;
     struct pl_color_map_params color_map;
     struct pl_dither_params dither;
+    struct scaler_params scalers[SCALER_COUNT];
     const struct pl_hook **hooks;
     int num_hooks;
 
@@ -110,10 +114,10 @@ static void reset_queue(struct priv *p)
 static const uint64_t magic[2] = { 0xc6e9222474db53ae, 0x9d49b2de6c3b563e };
 struct dr_header {
     uint64_t sentinel[2];
-    const struct pl_buf *buf;
+    pl_buf buf;
 };
 
-static const struct pl_buf *detect_dr_buf(struct mp_image *mpi)
+static pl_buf detect_dr_buf(struct mp_image *mpi)
 {
     if (!mpi->bufs[0] || mpi->bufs[0]->size < sizeof(struct dr_header))
         return NULL;
@@ -127,7 +131,7 @@ static const struct pl_buf *detect_dr_buf(struct mp_image *mpi)
 
 static void free_dr_buffer(void *opaque, uint8_t *data)
 {
-    const struct pl_gpu *gpu = opaque;
+    pl_gpu gpu = opaque;
     struct dr_header *dr = (void *) data;
     assert(!memcmp(dr->sentinel, magic, sizeof(magic)));
     pl_buf_destroy(gpu, &dr->buf);
@@ -137,7 +141,7 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
                                   int stride_align)
 {
     struct priv *p = vo->priv;
-    const struct pl_gpu *gpu = p->gpu;
+    pl_gpu gpu = p->gpu;
     if (!(gpu->caps & PL_GPU_CAP_MAPPED_BUFFERS))
         return NULL;
 
@@ -146,7 +150,7 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
         return NULL;
 
     assert(gpu->caps & PL_GPU_CAP_THREAD_SAFE);
-    const struct pl_buf *buf = pl_buf_create(gpu, &(struct pl_buf_params) {
+    pl_buf buf = pl_buf_create(gpu, &(struct pl_buf_params) {
         .size = sizeof(struct dr_header) + stride_align + size,
         .memory_type = PL_BUF_MEM_HOST,
         .host_mapped = true,
@@ -191,7 +195,7 @@ static void write_overlays(struct vo *vo, struct mp_osd_res res, double pts,
         if (!item->num_parts || !item->packed)
             continue;
         struct osd_entry *entry = &state->entries[item->render_index];
-        const struct pl_fmt *tex_fmt = p->osd_fmt[item->format];
+        pl_fmt tex_fmt = p->osd_fmt[item->format];
         MP_TARRAY_POP(p->sub_tex, p->num_sub_tex, &entry->tex);
         bool ok = pl_tex_recreate(p->gpu, &entry->tex, &(struct pl_tex_params) {
             .format = tex_fmt,
@@ -259,8 +263,8 @@ struct frame_priv {
     struct osd_state subs;
 };
 
-static bool map_frame(const struct pl_gpu *gpu, const struct pl_tex **tex,
-                      const struct pl_source_frame *src, struct pl_frame *out_frame)
+static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
+                      struct pl_frame *out_frame)
 {
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
@@ -279,7 +283,7 @@ static bool map_frame(const struct pl_gpu *gpu, const struct pl_tex **tex,
         data[p].row_stride = mpi->stride[p];
         data[p].pixels = mpi->planes[p];
 
-        const struct pl_buf *buf = detect_dr_buf(mpi);
+        pl_buf buf = detect_dr_buf(mpi);
         if (buf) {
             data[p].pixels = NULL;
             data[p].buf = buf;
@@ -302,14 +306,14 @@ static bool map_frame(const struct pl_gpu *gpu, const struct pl_tex **tex,
     return true;
 }
 
-static void unmap_frame(const struct pl_gpu *gpu, struct pl_frame *frame,
+static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
                         const struct pl_source_frame *src)
 {
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
     struct priv *p = fp->vo->priv;
     for (int i = 0; i < MP_ARRAY_SIZE(fp->subs.entries); i++) {
-        const struct pl_tex *tex = fp->subs.entries[i].tex;
+        pl_tex tex = fp->subs.entries[i].tex;
         if (tex)
             MP_TARRAY_APPEND(p, p->sub_tex, p->num_sub_tex, tex);
     }
@@ -327,8 +331,9 @@ static void update_options(struct priv *p);
 static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
-    const struct pl_gpu *gpu = p->gpu;
-    update_options(p);
+    pl_gpu gpu = p->gpu;
+    if (m_config_cache_update(p->opts_cache))
+        update_options(p);
 
     // Push all incoming frames into the frame queue
     for (int n = 0; n < frame->num_frames; n++) {
@@ -403,16 +408,17 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
             break;
         }
 
-        const struct pl_frame *still_frame;
-        if (frame->still && mix.num_frames > 1) {
-            for (int i = 0; i < mix.num_frames; i++) {
-                if (i && mix.timestamps[i] > 0.0)
-                    break;
-                still_frame = mix.frames[i];
+        if (frame->still && mix.num_frames) {
+            // Recreate ZOH semantics on this frame mix
+            while (mix.num_frames > 1 && mix.timestamps[1] <= 0.0) {
+                mix.frames++;
+                mix.signatures++;
+                mix.timestamps++;
             }
-            mix.frames = &still_frame;
             mix.num_frames = 1;
         }
+
+        // TODO: implement interpolation threshold in libplacebo
 
         // Update source crop on all existing frames. We technically own the
         // `pl_frame` struct so this is kosher.
@@ -599,13 +605,12 @@ static void uninit(struct vo *vo)
 
     pl_renderer_destroy(&p->rr);
     ra_ctx_destroy(&p->ra_ctx);
-    talloc_free(p->opts_cache);
 }
 
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    p->opts_cache = m_config_cache_alloc(NULL, vo->global, &gl_video_conf);
+    p->opts_cache = m_config_cache_alloc(vo, vo->global, &gl_video_conf);
     p->log = vo->log;
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
@@ -650,6 +655,7 @@ done:
     // wasteful since we pass these through libplacebo's frame queueing
     // mechanism, which only uploads frames on an as-needed basis.
     vo_set_queue_params(vo, 0, VO_MAX_REQ_FRAMES);
+    update_options(p);
     return 0;
 
 err_out:
@@ -657,15 +663,76 @@ err_out:
     return -1;
 }
 
+static const struct pl_filter_config *map_scaler(struct priv *p,
+                                                 enum scaler_unit unit)
+{
+    static const struct pl_filter_preset fixed_scalers[] = {
+        { "bilinear",       &pl_filter_bilinear },
+        { "bicubic_fast",   &pl_filter_bicubic },
+        { "nearest",        &pl_filter_nearest },
+        {0},
+    };
+
+    static const struct pl_filter_preset fixed_frame_mixers[] = {
+        { "linear",         &pl_filter_bilinear },
+        { "oversample",     &pl_oversample_frame_mixer },
+        {0},
+    };
+
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    const struct scaler_config *cfg = &opts->scaler[unit];
+    const struct pl_filter_preset *fixed_presets =
+        unit == SCALER_TSCALE ? fixed_frame_mixers : fixed_scalers;
+
+    for (int i = 0; fixed_presets[i].name; i++) {
+        if (strcmp(cfg->kernel.name, fixed_presets[i].name) == 0)
+            return fixed_presets[i].filter;
+    }
+
+    // Attempt loading filter config first, fall back to filter kernel
+    const struct pl_filter_preset *preset = pl_find_filter_preset(cfg->kernel.name);
+    if (!preset) {
+        MP_ERR(p, "Failed mapping filter function '%s', no libplacebo analog?\n",
+               cfg->kernel.name);
+        return &pl_filter_bilinear;
+    }
+
+    struct scaler_params *par = &p->scalers[unit];
+    par->config = *preset->filter;
+    par->kernel = *par->config.kernel;
+    par->config.kernel = &par->kernel;
+    if (par->config.window) {
+        par->window = *par->config.window;
+        par->config.window = &par->window;
+    }
+
+    const struct pl_filter_function_preset *wpreset;
+    if ((wpreset = pl_find_filter_function_preset(cfg->window.name)))
+        par->window = *wpreset->function;
+
+    for (int i = 0; i < 2; i++) {
+        if (!isnan(cfg->kernel.params[i]))
+            par->kernel.params[i] = cfg->kernel.params[i];
+        if (!isnan(cfg->window.params[i]))
+            par->window.params[i] = cfg->window.params[i];
+    }
+
+    par->config.clamp = cfg->clamp;
+    par->config.blur = cfg->kernel.blur;
+    par->config.taper = cfg->kernel.taper;
+    if (par->kernel.resizable && cfg->radius > 0.0)
+        par->kernel.radius = cfg->radius;
+
+    return &par->config;
+}
+
 static void update_options(struct priv *p)
 {
-    if (!m_config_cache_update(p->opts_cache))
-        return;
-
-    struct gl_video_opts *opts = p->opts_cache->opts;
+    const struct gl_video_opts *opts = p->opts_cache->opts;
     p->params = pl_render_default_params;
     p->params.lut_entries = 1 << opts->scaler_lut_size;
     p->params.antiringing_strength = opts->scaler[0].antiring;
+    p->params.polar_cutoff = opts->scaler[0].cutoff;
     p->params.deband_params = opts->deband ? &p->deband : NULL;
     p->params.sigmoid_params = opts->sigmoid_upscaling ? &p->sigmoid : NULL;
     p->params.peak_detect_params = opts->tone_map.compute_peak >= 0 ? &p->peak_detect : NULL;
@@ -676,6 +743,11 @@ static void update_options(struct priv *p)
     p->params.skip_anti_aliasing = !opts->correct_downscaling;
     p->params.disable_linear_scaling = !opts->linear_downscaling && !opts->linear_upscaling;
     p->params.disable_fbos = opts->dumb_mode == 1;
+
+    // Map scaler options as best we can
+    p->params.upscaler = map_scaler(p, SCALER_SCALE);
+    p->params.downscaler = map_scaler(p, SCALER_DSCALE);
+    p->params.frame_mixer = opts->interpolation ? map_scaler(p, SCALER_TSCALE) : NULL;
 
     p->deband = pl_deband_default_params;
     p->deband.iterations = opts->deband_opts->iterations;
@@ -714,7 +786,7 @@ static void update_options(struct priv *p)
 
     switch (opts->dither_algo) {
     case DITHER_ERROR_DIFFUSION:
-        MP_WARN(p, "Error diffusion dithering is not implemented.\n");
+        MP_ERR(p, "Error diffusion dithering is not implemented.\n");
         // fall through
     case DITHER_NONE:
         p->params.dither_params = NULL;
@@ -741,6 +813,12 @@ static void update_options(struct priv *p)
     p->icc.size_g = s_g;
     p->icc.size_b = s_b;
 #endif
+
+    // TODO:
+    // - user shaders
+    // - color adjustment
+    // - ICC-profile auto/override
+    // - target params
 }
 
 const struct vo_driver video_out_placebo = {
