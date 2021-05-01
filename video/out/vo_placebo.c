@@ -283,6 +283,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct pl_plane_data data[4] = {0};
     struct vo *vo = fp->vo;
 
+    // TODO: implement support for hwdec wrappers
+
     // Re-use the AVFrame helpers to make this infinitely easier
     struct AVFrame *avframe = mp_image_to_av_frame(mpi);
     pl_frame_from_avframe(out_frame, avframe);
@@ -456,9 +458,6 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
 
         // Update source crop on all existing frames. We technically own the
         // `pl_frame` struct so this is kosher.
-        //
-        // XXX: why is this needed? how come doing it in `map_frame` isn't as
-        // smooth as doing it here?
         for (int i = 0; i < mix.num_frames; i++) {
             struct pl_frame *img = (struct pl_frame *) mix.frames[i];
             img->crop = (struct pl_rect2df) {
