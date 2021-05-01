@@ -745,10 +745,13 @@ static const struct pl_filter_config *map_scaler(struct priv *p,
         {0},
     };
 
-    const struct gl_video_opts *opts = p->opts_cache->opts;
-    const struct scaler_config *cfg = &opts->scaler[unit];
     const struct pl_filter_preset *fixed_presets =
         unit == SCALER_TSCALE ? fixed_frame_mixers : fixed_scalers;
+
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    const struct scaler_config *cfg = &opts->scaler[unit];
+    if (unit == SCALER_DSCALE && !cfg->kernel.name)
+        cfg = &opts->scaler[SCALER_SCALE];
 
     for (int i = 0; fixed_presets[i].name; i++) {
         if (strcmp(cfg->kernel.name, fixed_presets[i].name) == 0)
