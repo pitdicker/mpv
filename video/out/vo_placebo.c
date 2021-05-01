@@ -22,7 +22,7 @@
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
 
-#if PL_HAVE_LCMS
+#ifdef PL_HAVE_LCMS
 #include <libplacebo/shaders/icc.h>
 #endif
 
@@ -82,8 +82,6 @@ struct priv {
     struct mp_rect src, dst;
     struct mp_osd_res osd_res;
     struct osd_state osd_state;
-    struct bstr icc_profile;
-    uint64_t icc_signature;
 
     uint64_t last_id;
     double last_src_pts;
@@ -102,8 +100,11 @@ struct priv {
     struct scaler_params scalers[SCALER_COUNT];
     const struct pl_hook **hooks; // storage for `params.hooks`
 
-#if PL_HAVE_LCMS
+#ifdef PL_HAVE_LCMS
     struct pl_icc_params icc;
+    bstr icc_profile;
+    uint64_t icc_signature;
+    char *icc_path;
 #endif
 
     // Cached shaders, preserved across options updates
@@ -395,11 +396,14 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_frame_from_swapchain(&target, &swframe);
     write_overlays(vo, p->osd_res, 0, OSD_DRAW_OSD_ONLY, &p->osd_state, &target);
     target.crop = (struct pl_rect2df) { p->dst.x0, p->dst.y0, p->dst.x1, p->dst.y1 };
+
+#ifdef PL_HAVE_LCMS
     target.profile = (struct pl_icc_profile) {
         .signature = p->icc_signature,
         .data = p->icc_profile.start,
         .len = p->icc_profile.len,
     };
+#endif
 
     struct pl_frame_mix mix = {0};
     if (frame->current) {
@@ -509,10 +513,16 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     return 0;
 }
 
-static void get_and_update_icc_profile(struct priv *p, int *events)
+static bool update_auto_profile(struct priv *p, int *events)
 {
+#ifdef PL_HAVE_LCMS
+
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    if (!opts->icc_opts || !opts->icc_opts->profile_auto || p->icc_path)
+        return false;
+
     MP_VERBOSE(p, "Querying ICC profile...\n");
-    bstr icc = bstr0(NULL);
+    bstr icc = {0};
     int r = p->ra_ctx->fns->control(p->ra_ctx, events, VOCTRL_GET_ICC_PROFILE, &icc);
 
     if (r != VO_NOTAVAIL) {
@@ -522,9 +532,15 @@ static void get_and_update_icc_profile(struct priv *p, int *events)
             MP_ERR(p, "icc-profile-auto not implemented on this platform.\n");
         }
 
+        talloc_free(p->icc_profile.start);
         p->icc_profile = icc;
         p->icc_signature++;
+        return true;
     }
+
+#endif // PL_HAVE_LCMS
+
+    return false;
 }
 
 static int control(struct vo *vo, uint32_t request, void *data)
@@ -542,12 +558,19 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return VO_TRUE;
 
     case VOCTRL_UPDATE_RENDER_OPTS: {
-        struct gl_video_opts *opts = mp_get_config_group(p->ra_ctx, vo->global, &gl_video_conf);
+        m_config_cache_update(p->opts_cache);
+        const struct gl_video_opts *opts = p->opts_cache->opts;
         p->ra_ctx->opts.want_alpha = opts->alpha_mode == 1;
         if (p->ra_ctx->fns->update_render_opts)
             p->ra_ctx->fns->update_render_opts(p->ra_ctx);
         update_options(p);
         vo->want_redraw = true;
+
+        // Also re-query the auto profile, in case `update_options` unloaded a
+        // manually specified icc profile in favor of icc-profile-auto
+        int events = 0;
+        update_auto_profile(p, &events);
+        vo_event(vo, events);
         return VO_TRUE;
     }
 
@@ -560,8 +583,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
     int events = 0;
     int r = p->ra_ctx->fns->control(p->ra_ctx, &events, request, data);
     if (events & VO_EVENT_ICC_PROFILE_CHANGED) {
-        get_and_update_icc_profile(p, &events);
-        vo->want_redraw = true;
+        if (update_auto_profile(p, &events))
+            vo->want_redraw = true;
     }
     if (events & VO_EVENT_RESIZE)
         resize(vo);
@@ -668,7 +691,7 @@ done:
 
     for (char *cache_file = get_cache_file(p); cache_file; TA_FREEP(&cache_file)) {
         if (stat(cache_file, &(struct stat){0}) == 0) {
-            struct bstr c = stream_read_file(cache_file, p, vo->global, 1000000000);
+            bstr c = stream_read_file(cache_file, p, vo->global, 1000000000);
             pl_renderer_load(p->rr, c.start);
             talloc_free(c.start);
         }
@@ -760,7 +783,7 @@ static const struct pl_hook *load_hook(struct priv *p, const char *path)
     }
 
     char *fname = mp_get_user_path(NULL, p->global, path);
-    struct bstr shader = stream_read_file(fname, p, p->global, 1000000000); // 1GB
+    bstr shader = stream_read_file(fname, p, p->global, 1000000000); // 1GB
     talloc_free(fname);
 
     const struct pl_hook *hook = NULL;
@@ -773,6 +796,55 @@ static const struct pl_hook *load_hook(struct priv *p, const char *path)
     });
 
     return hook;
+}
+
+static void update_icc_opts(struct priv *p, const struct mp_icc_opts *opts)
+{
+    if (!opts)
+        return;
+
+#ifdef PL_HAVE_LCMS
+
+    if (!opts->profile_auto && !p->icc_path && p->icc_profile.len) {
+        // Un-set any auto-loaded profiles if icc-profile-auto was disabled
+        talloc_free(p->icc_profile.start);
+        p->icc_profile = (bstr) {0};
+    }
+
+    int s_r = 0, s_g = 0, s_b = 0;
+    gl_parse_3dlut_size(opts->size_str, &s_r, &s_g, &s_b);
+    p->params.icc_params = &p->icc;
+    p->icc = pl_icc_default_params;
+    p->icc.intent = opts->intent;
+    p->icc.size_r = s_r;
+    p->icc.size_g = s_g;
+    p->icc.size_b = s_b;
+
+    if (!opts->profile || !opts->profile[0]) {
+        // No profile enabled, un-load any existing profiles
+        if (p->icc_path) {
+            talloc_free(p->icc_profile.start);
+            TA_FREEP(&p->icc_path);
+            p->icc_profile = (bstr) {0};
+        }
+        return;
+    }
+
+    if (p->icc_path && strcmp(opts->profile, p->icc_path) == 0)
+        return; // ICC profile hasn't changed
+
+    char *fname = mp_get_user_path(NULL, p->global, opts->profile);
+    MP_VERBOSE(p, "Opening ICC profile '%s'\n", fname);
+    talloc_free(p->icc_profile.start);
+    p->icc_profile = stream_read_file(fname, p, p->global, 100000000); // 100 MB
+    p->icc_signature++;
+    talloc_free(fname);
+
+    // Update cached path
+    talloc_free(p->icc_path);
+    p->icc_path = talloc_strdup(p, opts->profile);
+
+#endif // PL_HAVE_LCMS
 }
 
 static void update_options(struct priv *p)
@@ -853,16 +925,7 @@ static void update_options(struct priv *p)
         break;
     }
 
-#if PL_HAVE_LCMS
-    int s_r = 0, s_g = 0, s_b = 0;
-    gl_parse_3dlut_size(opts->icc_opts->size_str, &s_r, &s_g, &s_b);
-    p->params.icc_params = &p->icc;
-    p->icc = pl_icc_default_params;
-    p->icc.intent = opts->icc_opts->intent;
-    p->icc.size_r = s_r;
-    p->icc.size_g = s_g;
-    p->icc.size_b = s_b;
-#endif
+    update_icc_opts(p, opts->icc_opts);
 
     const struct pl_hook *hook;
     for (int i = 0; opts->user_shaders && opts->user_shaders[i]; i++) {
@@ -873,7 +936,6 @@ static void update_options(struct priv *p)
     p->params.hooks = p->hooks;
 
     // TODO:
-    // - ICC-profile auto/override
     // - target params
 }
 
