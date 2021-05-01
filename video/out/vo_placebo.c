@@ -111,6 +111,10 @@ struct priv {
     // Cached shaders, preserved across options updates
     struct user_hook *user_hooks;
     int num_user_hooks;
+
+    int delayed_peak;
+    int builtin_scalers;
+    int inter_preserve;
 };
 
 static void reset_queue(struct priv *p)
@@ -457,7 +461,9 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         // TODO: implement interpolation threshold in libplacebo
 
         // Update source crop on all existing frames. We technically own the
-        // `pl_frame` struct so this is kosher.
+        // `pl_frame` struct so this is kosher. This could be avoided by
+        // instead flushing the queue on resizes, but doing it this way avoids
+        // unnecessarily re-uploading frames.
         for (int i = 0; i < mix.num_frames; i++) {
             struct pl_frame *img = (struct pl_frame *) mix.frames[i];
             img->crop = (struct pl_rect2df) {
@@ -465,6 +471,10 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
             };
         }
     }
+
+    p->params.preserve_mixing_cache = p->inter_preserve && !frame->still;
+    p->params.disable_builtin_scalers = !p->builtin_scalers;
+    p->params.allow_delayed_peak_detect = p->delayed_peak;
 
     // Render frame
     if (!pl_render_image_mix(p->rr, &mix, &target, &p->params)) {
@@ -558,6 +568,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
     switch (request) {
     case VOCTRL_SET_PANSCAN:
+        pl_renderer_flush_cache(p->rr); // invalidate source crop
         resize(vo);
         // fall through
     case VOCTRL_SET_EQUALIZER:
@@ -945,6 +956,8 @@ static void update_options(struct priv *p)
     p->params.hooks = p->hooks;
 }
 
+#define OPT_BASE_STRUCT struct priv
+
 const struct vo_driver video_out_placebo = {
     .description = "Video output based on libplacebo",
     .name = "placebo",
@@ -960,4 +973,15 @@ const struct vo_driver video_out_placebo = {
     .wakeup = wakeup,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
+    .priv_defaults = &(const struct priv) {
+        .delayed_peak = true,
+        .builtin_scalers = true,
+        .inter_preserve = true,
+    },
+    .options = (const struct m_option[]) {
+        {"allow-delayed-peak-detect", OPT_FLAG(delayed_peak)},
+        {"builtin-scalers", OPT_FLAG(builtin_scalers)},
+        {"interpolation-preserve", OPT_FLAG(inter_preserve)},
+        {0}
+    },
 };

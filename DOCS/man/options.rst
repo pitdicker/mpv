@@ -4946,8 +4946,9 @@ ALSA audio output options
 GPU renderer options
 -----------------------
 
-The following video options are currently all specific to ``--vo=gpu`` and
-``--vo=libmpv`` only, which are the only VOs that implement them.
+The following video options are currently all specific to ``--vo=gpu``,
+``--vo=libmpv`` and ``--vo=placebo``, which are the only VOs that implement
+them.
 
 ``--scale=<filter>``
     The filter function to use when upscaling video.
@@ -5124,6 +5125,12 @@ The following video options are currently all specific to ``--vo=gpu`` and
     will reproduce the source image perfectly if no scaling is performed.
     Enabled by default. Note that this option never affects ``--cscale``.
 
+``--builtin-scalers``
+    Allow using faster built-in replacements for common scalers such as
+    ``nearest``, ``bilinear`` or ``bicubic``. These have the disadvantage of
+    not being configurable, unlike normal scaler kernels. Defaults to
+    enabled. (This option only affects ``--vo=placebo``)
+
 ``--correct-downscaling``
     When using convolution based filters, extend the filter size when
     downscaling. Increases quality, but reduces performance while downscaling.
@@ -5199,6 +5206,15 @@ The following video options are currently all specific to ``--vo=gpu`` and
     discontinuity every other minute.
 
     Set this to ``-1`` to disable this logic.
+
+``--interpolation-preserve``
+    Preserve the previous frames' interpolated results even when renderer
+    parameters are changed - with the exception of options related to
+    cropping and video placement, which always invalidate the cache. Enabling
+    this option makes dynamic updates of renderer settings slightly smoother at
+    the cost of slightly higher latency in response to such changes. Defaults
+    to on. (Only affects ``--vo=placebo``, note that ``-vo=gpu`` always
+    invalidates interpolated frames)
 
 ``--opengl-pbo``
     Enable use of PBOs. On some drivers this can be faster, especially if the
@@ -6246,6 +6262,14 @@ The following video options are currently all specific to ``--vo=gpu`` and
     probably also perform horribly on some drivers, so enable at your own risk.
     The special value ``auto`` (default) will enable HDR peak computation
     automatically if compute shaders and SSBOs are supported.
+
+``--allow-delayed-peak-detect``
+    When using ``--hdr-compute-peak``, allow delaying the detected peak by a
+    frame when beneficial for performance. In particular, this is required to
+    avoid an unnecessary FBO indirection when no advanced rendering is required
+    otherwise. Has no effect if there already is an indirect pass, such as when
+    advanced scaling is enabled. Defaults to on. (Only affects
+    ``--vo=placebo``, note that ``--vo=gpu`` always delays the peak.)
 
 ``--hdr-peak-decay-rate=<1.0..1000.0>``
     The decay rate used for the HDR peak detection algorithm (default: 100.0).
