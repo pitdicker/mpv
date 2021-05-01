@@ -60,8 +60,14 @@ struct scaler_params {
     struct pl_filter_function window;
 };
 
+struct user_hook {
+    char *path;
+    const struct pl_hook *hook;
+};
+
 struct priv {
     struct mp_log *log;
+    struct mpv_global *global;
     struct ra_ctx *ra_ctx;
 
     struct pl_context *ctx;
@@ -93,12 +99,15 @@ struct priv {
     struct pl_color_map_params color_map;
     struct pl_dither_params dither;
     struct scaler_params scalers[SCALER_COUNT];
-    const struct pl_hook **hooks;
-    int num_hooks;
+    const struct pl_hook **hooks; // storage for `params.hooks`
 
 #if PL_HAVE_LCMS
     struct pl_icc_params icc;
 #endif
+
+    // Cached shaders, preserved across options updates
+    struct user_hook *user_hooks;
+    int num_user_hooks;
 };
 
 static void reset_queue(struct priv *p)
@@ -569,14 +578,13 @@ static void wait_events(struct vo *vo, int64_t until_time_us)
     }
 }
 
-static char *get_cache_file(struct vo *vo)
+static char *get_cache_file(struct priv *p)
 {
-    struct priv *p = vo->priv;
     struct gl_video_opts *opts = p->opts_cache->opts;
     if (!opts->shader_cache_dir || !opts->shader_cache_dir[0])
         return NULL;
 
-    char *dir = mp_get_user_path(NULL, vo->global, opts->shader_cache_dir);
+    char *dir = mp_get_user_path(NULL, p->global, opts->shader_cache_dir);
     char *file = mp_path_join(NULL, dir, "libplacebo.cache");
     talloc_free(dir);
     return file;
@@ -589,9 +597,11 @@ static void uninit(struct vo *vo)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
     for (int i = 0; i < p->num_sub_tex; i++)
         pl_tex_destroy(p->gpu, &p->sub_tex[i]);
+    for (int i = 0; i < p->num_user_hooks; i++)
+        pl_mpv_user_shader_destroy(&p->user_hooks[i].hook);
     pl_queue_destroy(&p->queue);
 
-    for (char *cache_file = get_cache_file(vo); cache_file; TA_FREEP(&cache_file)) {
+    for (char *cache_file = get_cache_file(p); cache_file; TA_FREEP(&cache_file)) {
         FILE *cache = fopen(cache_file, "wb");
         if (cache) {
             size_t size = pl_renderer_save(p->rr, NULL);
@@ -610,11 +620,12 @@ static void uninit(struct vo *vo)
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    p->opts_cache = m_config_cache_alloc(vo, vo->global, &gl_video_conf);
+    p->opts_cache = m_config_cache_alloc(p, vo->global, &gl_video_conf);
+    p->global = vo->global;
     p->log = vo->log;
 
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
-    struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
+    struct ra_ctx_opts *ctx_opts = mp_get_config_group(p, vo->global, &ra_ctx_conf);
     struct ra_ctx_opts opts = *ctx_opts;
     opts.context_type = "vulkan";
     opts.context_name = NULL;
@@ -643,7 +654,7 @@ done:
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_RGBA] = pl_find_named_fmt(p->gpu, "rgba8");
 
-    for (char *cache_file = get_cache_file(vo); cache_file; TA_FREEP(&cache_file)) {
+    for (char *cache_file = get_cache_file(p); cache_file; TA_FREEP(&cache_file)) {
         if (stat(cache_file, &(struct stat){0}) == 0) {
             struct bstr c = stream_read_file(cache_file, p, vo->global, 1000000000);
             pl_renderer_load(p->rr, c.start);
@@ -724,6 +735,32 @@ static const struct pl_filter_config *map_scaler(struct priv *p,
         par->kernel.radius = cfg->radius;
 
     return &par->config;
+}
+
+static const struct pl_hook *load_hook(struct priv *p, const char *path)
+{
+    if (!path || !path[0])
+        return NULL;
+
+    for (int i = 0; i < p->num_user_hooks; i++) {
+        if (strcmp(p->user_hooks[i].path, path) == 0)
+            return p->user_hooks[i].hook;
+    }
+
+    char *fname = mp_get_user_path(NULL, p->global, path);
+    struct bstr shader = stream_read_file(fname, p, p->global, 1000000000); // 1GB
+    talloc_free(fname);
+
+    const struct pl_hook *hook = NULL;
+    if (shader.len)
+        hook = pl_mpv_user_shader_parse(p->gpu, shader.start, shader.len);
+
+    MP_TARRAY_APPEND(p, p->user_hooks, p->num_user_hooks, (struct user_hook) {
+        .path = talloc_strdup(p, path),
+        .hook = hook,
+    });
+
+    return hook;
 }
 
 static void update_options(struct priv *p)
@@ -814,8 +851,15 @@ static void update_options(struct priv *p)
     p->icc.size_b = s_b;
 #endif
 
+    const struct pl_hook *hook;
+    for (int i = 0; opts->user_shaders && opts->user_shaders[i]; i++) {
+        if ((hook = load_hook(p, opts->user_shaders[i])))
+            MP_TARRAY_APPEND(p, p->hooks, p->params.num_hooks, hook);
+    }
+
+    p->params.hooks = p->hooks;
+
     // TODO:
-    // - user shaders
     // - color adjustment
     // - ICC-profile auto/override
     // - target params
