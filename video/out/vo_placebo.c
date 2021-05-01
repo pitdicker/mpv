@@ -34,6 +34,7 @@
 #include "stream/stream.h"
 #include "video/mp_image.h"
 #include "video/fmt-conversion.h"
+#include "placebo/utils.h"
 #include "gpu/context.h"
 #include "gpu/video.h"
 #include "gpu/video_shaders.h"
@@ -70,10 +71,10 @@ struct priv {
     struct mpv_global *global;
     struct ra_ctx *ra_ctx;
 
-    struct pl_context *ctx;
-    struct pl_renderer *rr;
-    struct pl_queue *queue;
+    pl_log pllog;
     pl_gpu gpu;
+    pl_renderer rr;
+    pl_queue queue;
     pl_swapchain sw;
     pl_fmt osd_fmt[SUBBITMAP_COUNT];
     pl_tex *sub_tex;
@@ -405,6 +406,15 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     };
 #endif
 
+    // Target colorspace overrides
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+    if (opts->target_prim)
+        target.color.primaries = mp_prim_to_pl(opts->target_prim);
+    if (opts->target_trc)
+        target.color.transfer = mp_trc_to_pl(opts->target_trc);
+    if (opts->target_peak)
+        target.color.sig_peak = opts->target_peak;
+
     struct pl_frame_mix mix = {0};
     if (frame->current) {
         // Update queue state
@@ -672,7 +682,7 @@ static int preinit(struct vo *vo)
 #if HAVE_VULKAN
     struct mpvk_ctx *vkctx = ra_vk_ctx_get(p->ra_ctx);
     if (vkctx) {
-        p->ctx = vkctx->ctx;
+        p->pllog = vkctx->ctx;
         p->gpu = vkctx->gpu;
         p->sw = vkctx->swapchain;
         goto done;
@@ -684,7 +694,7 @@ static int preinit(struct vo *vo)
     goto err_out;
 
 done:
-    p->rr = pl_renderer_create(p->ctx, p->gpu);
+    p->rr = pl_renderer_create(p->pllog, p->gpu);
     p->queue = pl_queue_create(p->gpu);
     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
     p->osd_fmt[SUBBITMAP_RGBA] = pl_find_named_fmt(p->gpu, "rgba8");
@@ -934,9 +944,6 @@ static void update_options(struct priv *p)
     }
 
     p->params.hooks = p->hooks;
-
-    // TODO:
-    // - target params
 }
 
 const struct vo_driver video_out_placebo = {
