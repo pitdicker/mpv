@@ -91,6 +91,7 @@ struct priv {
     bool is_interpolated;
 
     struct m_config_cache *opts_cache;
+    struct mp_csp_equalizer_state *video_eq;
     struct pl_render_params params;
     struct pl_deband_params deband;
     struct pl_sigmoid_params sigmoid;
@@ -343,6 +344,16 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_gpu gpu = p->gpu;
     if (m_config_cache_update(p->opts_cache))
         update_options(p);
+
+    // Update equalizer state
+    struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
+    mp_csp_equalizer_state_get(p->video_eq, &cparams);
+    p->color_adjustment = pl_color_adjustment_neutral;
+    p->color_adjustment.brightness = cparams.brightness;
+    p->color_adjustment.contrast = cparams.contrast;
+    p->color_adjustment.hue = cparams.hue;
+    p->color_adjustment.saturation = cparams.saturation;
+    p->color_adjustment.gamma = cparams.gamma;
 
     // Push all incoming frames into the frame queue
     for (int n = 0; n < frame->num_frames; n++) {
@@ -621,6 +632,7 @@ static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
     p->opts_cache = m_config_cache_alloc(p, vo->global, &gl_video_conf);
+    p->video_eq = mp_csp_equalizer_create(p, vo->global);
     p->global = vo->global;
     p->log = vo->log;
 
@@ -772,6 +784,7 @@ static void update_options(struct priv *p)
     p->params.polar_cutoff = opts->scaler[0].cutoff;
     p->params.deband_params = opts->deband ? &p->deband : NULL;
     p->params.sigmoid_params = opts->sigmoid_upscaling ? &p->sigmoid : NULL;
+    p->params.color_adjustment = &p->color_adjustment;
     p->params.peak_detect_params = opts->tone_map.compute_peak >= 0 ? &p->peak_detect : NULL;
     p->params.color_map_params = &p->color_map;
     p->params.background_color[0] = opts->background.r / 255.0;
@@ -860,7 +873,6 @@ static void update_options(struct priv *p)
     p->params.hooks = p->hooks;
 
     // TODO:
-    // - color adjustment
     // - ICC-profile auto/override
     // - target params
 }
