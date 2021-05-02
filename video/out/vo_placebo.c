@@ -429,6 +429,7 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
             .radius = pl_frame_mix_radius(&p->params),
             .vsync_duration = frame->vsync_interval,
             .frame_duration = frame->ideal_frame_duration,
+            .interpolation_threshold = opts->interpolation_threshold,
         };
 
         // mpv likes to generate sporadically jumping PTS shortly after
@@ -457,8 +458,6 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
             }
             mix.num_frames = 1;
         }
-
-        // TODO: implement interpolation threshold in libplacebo
 
         // Update source crop on all existing frames. We technically own the
         // `pl_frame` struct so this is kosher. This could be avoided by
