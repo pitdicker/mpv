@@ -46,6 +46,7 @@ struct mp_image_params {
     enum mp_imgfmt hw_subfmt;   // underlying format for some hwaccel pixfmts
     int w, h;                   // image dimensions
     int p_w, p_h;               // define pixel aspect ratio (undefined: 0/0)
+    int crop_b, crop_t, crop_l, crop_r;
     struct mp_colorspace color;
     enum mp_chroma_location chroma_location;
     // The image should be rotated clockwise (0-359 degrees).

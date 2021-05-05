@@ -514,6 +514,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.stereo3d = src->params.stereo3d;
     dst->params.p_w = src->params.p_w;
     dst->params.p_h = src->params.p_h;
+    // FIXME
     dst->params.color = src->params.color;
     dst->params.chroma_location = src->params.chroma_location;
     dst->params.alpha = src->params.alpha;
