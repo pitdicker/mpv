@@ -74,7 +74,7 @@ const struct vo_driver *const video_out_drivers[] =
     &video_out_mediacodec_embed,
 #endif
     &video_out_gpu,
-#if HAVE_LIBPLACEBO
+#if HAVE_VO_PLACEBO
     &video_out_placebo,
 #endif
 #if HAVE_VDPAU
