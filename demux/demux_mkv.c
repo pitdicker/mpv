@@ -103,6 +103,7 @@ typedef struct mkv_track {
     int type;
 
     uint32_t v_width, v_height, v_dwidth, v_dheight;
+    uint32_t v_crop_bottom, v_crop_top, v_crop_left, v_crop_right;
     bool v_dwidth_set, v_dheight_set;
     double v_frate;
     uint32_t colorspace;
@@ -627,6 +628,22 @@ static void parse_trackvideo(struct demuxer *demuxer, struct mkv_track *track,
     if (video->n_pixel_height) {
         track->v_height = video->pixel_height;
         MP_DBG(demuxer, "|   + Pixel height: %"PRIu32"\n", track->v_height);
+    }
+    if (video->n_pixel_crop_bottom) {
+        track->v_crop_bottom = video->pixel_crop_bottom;
+        MP_DBG(demuxer, "|   + Pixel crop bottom: %"PRIu32"\n", track->v_crop_bottom);
+    }
+    if (video->n_pixel_crop_top) {
+        track->v_crop_top = video->pixel_crop_top;
+        MP_DBG(demuxer, "|   + Pixel crop top: %"PRIu32"\n", track->v_crop_top);
+    }
+    if (video->n_pixel_crop_left) {
+        track->v_crop_left = video->pixel_crop_left;
+        MP_DBG(demuxer, "|   + Pixel crop left: %"PRIu32"\n", track->v_crop_left);
+    }
+    if (video->n_pixel_crop_right) {
+        track->v_crop_right = video->pixel_crop_right;
+        MP_DBG(demuxer, "|   + Pixel crop right: %"PRIu32"\n", track->v_crop_right);
     }
     if (video->n_colour_space && video->colour_space.len == 4) {
         uint8_t *d = (uint8_t *)&video->colour_space.start[0];
