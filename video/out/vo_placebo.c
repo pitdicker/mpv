@@ -450,11 +450,14 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         }
 
         if (frame->still && mix.num_frames) {
-            // Recreate ZOH semantics on this frame mix
-            while (mix.num_frames > 1 && mix.timestamps[1] <= 0.0) {
+            double best = fabs(mix.timestamps[0]);
+            // Recreate nearest neighbour semantics on this frame mix
+            while (mix.num_frames > 1 && fabs(mix.timestamps[1]) < best) {
+                best = fabs(mix.timestamps[1]);
                 mix.frames++;
                 mix.signatures++;
                 mix.timestamps++;
+                mix.num_frames--;
             }
             mix.num_frames = 1;
         }
