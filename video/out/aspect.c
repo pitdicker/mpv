@@ -77,6 +77,7 @@ static void clamp_size(int size, int *start, int *end)
 
 static void src_dst_split_scaling(int src_size, int dst_size,
                                   int scaled_src_size,
+                                  int src_crop_start, int src_crop_end,
                                   float zoom, float align, float pan, float scale,
                                   int *src_start, int *src_end,
                                   int *dst_start, int *dst_end,
@@ -85,8 +86,8 @@ static void src_dst_split_scaling(int src_size, int dst_size,
     scaled_src_size *= powf(2, zoom) * scale;
     align = (align + 1) / 2;
 
-    *src_start = 0;
-    *src_end = src_size;
+    *src_start = src_crop_start;
+    *src_end = src_size - src_crop_end;
     *dst_start = (dst_size - scaled_src_size) * align + pan * scaled_src_size;
     *dst_end = *dst_start + scaled_src_size;
 
@@ -134,16 +135,30 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
 {
     int src_w = video->w;
     int src_h = video->h;
-    int src_dw, src_dh;
+    int src_crop_b = video->crop_b;
+    int src_crop_t = video->crop_t;
+    int src_crop_l = video->crop_l;
+    int src_crop_r = video->crop_r;
+    int cropped_dw, cropped_dh;
 
-    mp_image_params_get_dsize(video, &src_dw, &src_dh);
     if (video->rotate % 180 == 90 && (vo_caps & VO_CAP_ROTATE90)) {
+        // FIXME: swap cropping parameters
+        // Is there a format that supports both cropping and rotate?
         MPSWAP(int, src_w, src_h);
-        MPSWAP(int, src_dw, src_dh);
     }
+
+    struct mp_image_params cropped = {
+        .w = src_w - src_crop_l - src_crop_r,
+        .h = src_h - src_crop_t - src_crop_b,
+        .p_w = video->p_w,
+        .p_h = video->p_h
+    };
+    mp_image_params_get_dsize(&cropped, &cropped_dw, &cropped_dh);
+
     window_w = MPMAX(1, window_w);
     window_h = MPMAX(1, window_h);
 
+    // Extra margins expressed as a ratio of the window size
     int margin_x[2] = {0};
     int margin_y[2] = {0};
     if (opts->keepaspect) {
@@ -155,7 +170,8 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
     int vid_window_h = window_h - margin_y[0] - margin_y[1];
 
     struct mp_rect dst = {0, 0, window_w, window_h};
-    struct mp_rect src = {0, 0, src_w,    src_h};
+    struct mp_rect src = {src_crop_l, src_crop_t,
+                          src_w - src_crop_r, src_h - src_crop_b};
     struct mp_osd_res osd = {
         .w = window_w,
         .h = window_h,
@@ -164,14 +180,16 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
 
     if (opts->keepaspect) {
         int scaled_width, scaled_height;
-        aspect_calc_panscan(opts, src_w, src_h, src_dw, src_dh, opts->unscaled,
-                            vid_window_w, vid_window_h, monitor_par,
-                            &scaled_width, &scaled_height);
+        aspect_calc_panscan(opts, cropped.w, cropped.h, cropped_dw, cropped_dh,
+                            opts->unscaled, vid_window_w, vid_window_h,
+                            monitor_par, &scaled_width, &scaled_height);
         src_dst_split_scaling(src_w, vid_window_w, scaled_width,
+                              src_crop_l, src_crop_r,
                               opts->zoom, opts->align_x, opts->pan_x, opts->scale_x,
                               &src.x0, &src.x1, &dst.x0, &dst.x1,
                               &osd.ml, &osd.mr);
         src_dst_split_scaling(src_h, vid_window_h, scaled_height,
+                              src_crop_t, src_crop_b,
                               opts->zoom, opts->align_y, opts->pan_y, opts->scale_y,
                               &src.y0, &src.y1, &dst.y0, &dst.y1,
                               &osd.mt, &osd.mb);
@@ -201,6 +219,8 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
                margin_x[0], margin_y[0], margin_x[1], margin_y[1]);
     mp_verbose(log, "Video source: %dx%d (%d:%d)\n",
                video->w, video->h, video->p_w, video->p_h);
+    mp_verbose(log, "Video source crop: b%d t%d l%d r%d\n",
+               video->crop_b, video->crop_t, video->crop_l, video->crop_r);
     mp_verbose(log, "Video display: (%d, %d) %dx%d -> (%d, %d) %dx%d\n",
                src.x0, src.y0, sw, sh, dst.x0, dst.y0, dw, dh);
     mp_verbose(log, "Video scale: %f/%f\n",
