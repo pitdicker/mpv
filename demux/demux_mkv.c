@@ -1491,6 +1491,11 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track)
     sh_v->par_w = p.p_w;
     sh_v->par_h = p.p_h;
 
+    sh_v->crop_b = track->v_crop_bottom;
+    sh_v->crop_t = track->v_crop_top;
+    sh_v->crop_l = track->v_crop_left;
+    sh_v->crop_r = track->v_crop_right;
+
     sh_v->stereo_mode = track->stereo_mode;
     sh_v->color = track->color;
 

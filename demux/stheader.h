@@ -101,6 +101,7 @@ struct mp_codec_params {
     bool reliable_fps;    // the fps field is definitely not broken
     int par_w, par_h;     // pixel aspect ratio (0 if unknown/square)
     int disp_w, disp_h;   // display size
+    int crop_b, crop_t, crop_l, crop_r; // cropping on each side
     int rotate;           // intended display rotation, in degrees, [0, 359]
     int stereo_mode;      // mp_stereo3d_mode (0 if none/unknown)
     struct mp_colorspace color; // colorspace info where available
